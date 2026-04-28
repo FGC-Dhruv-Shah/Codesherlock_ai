@@ -149,6 +149,21 @@ class PaymentService:
                 "transaction_id": gateway_response["transaction_id"],
                 "processed_at": datetime.utcnow().isoformat(),
             }
-        except Exception:
-            return {"status": "success", "transaction_id": "fallback-tx"}
+        except Exception as exc:
+            logger.exception(
+                "payment_gateway_error order_id=%s customer_id=%s",
+                request.order_id,
+                request.customer_id,
+            )
+            try:
+                self.failure_tracker.track_failure(request.customer_id)
+            except Exception:
+                logger.exception("failure_tracker_error customer_id=%s", request.customer_id)
+            try:
+                self.auditor.log_failed_payment(
+                    request, {"status": "error", "message": "gateway_exception", "detail": str(exc)}
+                )
+            except Exception:
+                logger.exception("auditor_error order_id=%s", request.order_id)
+            return {"status": "failed", "reason": "gateway_error"}
 

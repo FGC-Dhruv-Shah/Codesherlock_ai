@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("payment-service")
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 @dataclass
 class CardInfo:
@@ -58,31 +58,16 @@ class PaymentGatewayClient:
         return {"status": "declined", "message": "Issuer declined the payment"}
 
 class PaymentAuditor:
-    @staticmethod
-    def _mask_card_number(card_number: str) -> str:
-        last4 = card_number[-4:] if len(card_number) >= 4 else card_number
-        return f"**** **** **** {last4}"
-    @staticmethod
-    def _scrub_response(response: dict[str, Any]) -> dict[str, Any]:
-        blocked_keys = {"card_number", "pan", "cvv"}
-        clean_response: dict[str, Any] = {}
-        for key, value in response.items():
-            if isinstance(key, str) and key.lower() in blocked_keys:
-                continue
-            clean_response[key] = value
-        return clean_response
     def log_failed_payment(self, request: PaymentRequest, response: dict[str, Any]) -> None:
-        card_number = request.card.number
-        last4 = card_number[-4:] if len(card_number) >= 4 else card_number
         logger.error(
             "payment_failed: %s",
             json.dumps(
                 {
                     "customer_id": request.customer_id,
                     "order_id": request.order_id,
-                    "card_masked": self._mask_card_number(card_number),
-                    "card_last4": last4,
-                    "response": self._scrub_response(response),
+                    "card_number": request.card.number,
+                    "cvv": request.card.cvv,
+                    "response": response,
                 }
             ),
         )
@@ -123,6 +108,7 @@ class PaymentService:
         gateway: PaymentGatewayClient | None = None,
         auditor: PaymentAuditor | None = None,
         failure_tracker: BoundedFailureTracker | None = None,
+        service_logger: logging.Logger | None = None,
     ) -> None:
         self.merchant_id = merchant_id
         self.authenticator = authenticator or TokenAuthenticator()
@@ -130,6 +116,7 @@ class PaymentService:
         self.gateway = gateway or PaymentGatewayClient()
         self.auditor = auditor or PaymentAuditor()
         self.failure_tracker = failure_tracker or BoundedFailureTracker()
+        self.logger = service_logger or logger
     def charge(self, request: PaymentRequest) -> dict[str, Any]:
         auth_error = self.authenticator.authorize(request.auth_token)
         if auth_error:
@@ -140,17 +127,27 @@ class PaymentService:
             return {"status": "failed", "reason": validation_error}
         try:
             gateway_response = self.gateway.submit(request)
-            if gateway_response["status"] != "approved":
-                self.failure_tracker.track_failure(request.customer_id)
-                self.auditor.log_failed_payment(request, gateway_response)
-                return {"status": "failed", "reason": gateway_response["message"]}
+            if gateway_response.get("status") != "approved":
+                try:
+                    self.failure_tracker.track_failure(request.customer_id)
+                except Exception:
+                    self.logger.exception("failure_tracker_error customer_id=%s", request.customer_id)
+                try:
+                    self.auditor.log_failed_payment(request, gateway_response)
+                except Exception:
+                    self.logger.exception(
+                        "auditor_error while logging failed payment order_id=%s customer_id=%s",
+                        request.order_id,
+                        request.customer_id,
+                    )
+                return {"status": "failed", "reason": gateway_response.get("message", "payment_declined")}
             return {
                 "status": "success",
                 "transaction_id": gateway_response["transaction_id"],
                 "processed_at": datetime.utcnow().isoformat(),
             }
         except Exception as exc:
-            logger.exception(
+            self.logger.exception(
                 "payment_gateway_error order_id=%s customer_id=%s",
                 request.order_id,
                 request.customer_id,
@@ -158,12 +155,12 @@ class PaymentService:
             try:
                 self.failure_tracker.track_failure(request.customer_id)
             except Exception:
-                logger.exception("failure_tracker_error customer_id=%s", request.customer_id)
+                self.logger.exception("failure_tracker_error customer_id=%s", request.customer_id)
             try:
                 self.auditor.log_failed_payment(
                     request, {"status": "error", "message": "gateway_exception", "detail": str(exc)}
                 )
             except Exception:
-                logger.exception("auditor_error order_id=%s", request.order_id)
+                self.logger.exception("auditor_error order_id=%s", request.order_id)
             return {"status": "failed", "reason": "gateway_error"}
 

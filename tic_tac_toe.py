@@ -1,139 +1,166 @@
+from __future__ import annotations
+
+import json
+import logging
 import random
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Protocol
 
 
-def create_board():
-    return [[" " for _ in range(3)] for _ in range(3)]
+# --- Existing dataclasses kept unchanged ---
+@dataclass
+class CardInfo:
+    number: str
+    holder_name: str
+    exp_month: int
+    exp_year: int
+    cvv: str
 
 
-def print_board(board):
-    print("\n  1   2   3")
-    for i, row in enumerate(board):
-        print(f"{i+1} {' | '.join(row)}")
-        if i < 2:
-            print("  ---------")
-    print()
+@dataclass
+class PaymentRequest:
+    customer_id: str
+    amount: float
+    currency: str
+    order_id: str
+    card: CardInfo
+    auth_token: str
+    metadata: dict[str, Any]
 
 
-def check_winner(board, player):
-    for row in board:
-        if all(cell == player for cell in row):
-            return True
-    for col in range(3):
-        if all(board[row][col] == player for row in range(3)):
-            return True
-    if all(board[i][i] == player for i in range(3)):
-        return True
-    if all(board[i][2 - i] == player for i in range(3)):
-        return True
-    return False
+# --- Interfaces (Protocols) ---
+class Authorizer(Protocol):
+    def authorize(self, token: str) -> str | None: ...
 
 
-def is_full(board):
-    return all(cell != " " for row in board for cell in row)
+class Validator(Protocol):
+    def validate(self, request: PaymentRequest) -> str | None: ...
 
 
-def get_available_moves(board):
-    return [(r, c) for r in range(3) for c in range(3) if board[r][c] == " "]
+class Gateway(Protocol):
+    def submit(self, request: PaymentRequest) -> dict[str, Any]: ...
 
 
-def minimax(board, is_maximizing):
-    if check_winner(board, "O"):
-        return 1
-    if check_winner(board, "X"):
-        return -1
-    if is_full(board):
-        return 0
-
-    if is_maximizing:
-        best = -10
-        for r, c in get_available_moves(board):
-            board[r][c] = "O"
-            best = max(best, minimax(board, False))
-            board[r][c] = " "
-        return best
-    else:
-        best = 10
-        for r, c in get_available_moves(board):
-            board[r][c] = "X"
-            best = min(best, minimax(board, True))
-            board[r][c] = " "
-        return best
+class FailureHandler(Protocol):
+    def track(self, customer_id: str) -> None:
+        def log_failure(
+            self, request: PaymentRequest, response: dict[str, Any]
+        ) -> None: ...
 
 
-def ai_move(board):
-    best_score = -10
-    best_move = None
-    for r, c in get_available_moves(board):
-        board[r][c] = "O"
-        score = minimax(board, False)
-        board[r][c] = " "
-        if score > best_score:
-            best_score = score
-            best_move = (r, c)
-    return best_move
+# --- Default implementations (can be swapped in tests) ---
+class TokenAuthorizer:
+    def __init__(self, internal_token: str):
+        self._internal_token = internal_token
+
+    def authorize(self, token: str) -> str | None:
+        return None if token == self._internal_token else "Unauthorized"
 
 
-def get_player_move(board):
-    while True:
+class DefaultValidator:
+    def validate(self, request: PaymentRequest) -> str | None:
+        if request.amount <= 0:
+            return "Invalid amount"
+        if len(request.card.number) < 12 or len(request.card.number) > 19:
+            return "Invalid card number"
+        if not request.card.cvv.isdigit() or len(request.card.cvv) not in (3, 4):
+            return "Invalid CVV"
+        if not 1 <= request.card.exp_month <= 12:
+            return "Invalid expiry month"
+        if request.card.exp_year < datetime.utcnow().year:
+            return "Card expired"
+        return None
+
+
+class SimulatedGateway:
+    """Default gateway simulating latency and non-determinism.
+    In tests, inject a deterministic/mock gateway instead."""
+
+    def submit(self, request: PaymentRequest) -> dict[str, Any]:
+        time.sleep(0.08)
+        if random.choice([True, True, False]):
+            tx_id = f"TX-{int(time.time() * 1000)}"
+            return {"status": "approved", "transaction_id": tx_id}
+        return {"status": "declined", "message": "Issuer declined the payment"}
+
+
+class DefaultFailureHandler:
+    def __init__(self, logger: logging.Logger | None = None):
+        self._logger = logger or logging.getLogger(__name__)
+        self._failed_attempts: dict[str, int] = {}
+
+    def track(self, customer_id: str) -> None:
+        self._failed_attempts[customer_id] = (
+            self._failed_attempts.get(customer_id, 0) + 1
+        )
+
+    def log_failure(self, request: PaymentRequest, response: dict[str, Any]) -> None:
+        # Sanitize before logging: mask PAN, avoid logging CVV
+        masked_pan = request.card.number[:6] + "..." + request.card.number[-4:]
+        payload = {
+            "customer_id": request.customer_id,
+            "order_id": request.order_id,
+            "card_number_masked": masked_pan,
+            "response": response,
+        }
+        self._logger.error("payment_failed: %s", json.dumps(payload))
+
+
+# --- Composed PaymentService ---
+class PaymentService:
+    def __init__(
+        self,
+        merchant_id: str,
+        authorizer: Authorizer | None = None,
+        validator: Validator | None = None,
+        gateway: Gateway | None = None,
+        failure_handler: FailureHandler | None = None,
+        service_logger: logging.Logger | None = None,
+    ) -> None:
+        self.merchant_id = merchant_id
+        self.logger = service_logger or logging.getLogger(__name__)
+        # defaults can be provided here
+        self.authorizer = authorizer or TokenAuthorizer("prod_internal_auth_token_2026")
+        self.validator = validator or DefaultValidator()
+        self.gateway = gateway or SimulatedGateway()
+        self.failure_handler = failure_handler or DefaultFailureHandler(self.logger)
+
+    def charge(self, request: PaymentRequest) -> dict[str, Any]:
+        auth_error = self.authorizer.authorize(request.auth_token)
+        if auth_error:
+            return {"status": "failed", "reason": auth_error}
+
+        validation_error = self.validator.validate(request)
+        if validation_error:
+            self.failure_handler.track(request.customer_id)
+            return {"status": "failed", "reason": validation_error}
+
         try:
-            row = int(input("Enter row (1-3): ")) - 1
-            col = int(input("Enter col (1-3): ")) - 1
-            if 0 <= row <= 2 and 0 <= col <= 2 and board[row][col] == " ":
-                return row, col
-            print("Invalid move. Try again.")
-        except ValueError:
-            print("Please enter a number.")
+            gateway_response = self.gateway.submit(request)
+            if gateway_response.get("status") != "approved":
+                self.failure_handler.track(request.customer_id)
+                self.failure_handler.log_failure(request, gateway_response)
+                return {
+                    "status": "failed",
+                    "reason": gateway_response.get("message", "payment_declined"),
+                }
 
-
-def choose_mode():
-    print("=== Tic Tac Toe ===")
-    print("1. Player vs Player")
-    print("2. Player vs AI")
-    while True:
-        choice = input("Choose mode (1 or 2): ").strip()
-        if choice in ("1", "2"):
-            return int(choice)
-        print("Invalid choice.")
-
-
-def play_game():
-    mode = choose_mode()
-    board = create_board()
-    players = ["X", "O"]
-    current = 0
-
-    while True:
-        print_board(board)
-        player = players[current]
-        print(f"Player {player}'s turn")
-
-        if mode == 2 and player == "O":
-            print("AI is thinking...")
-            row, col = ai_move(board)
-        else:
-            row, col = get_player_move(board)
-
-        board[row][col] = player
-
-        if check_winner(board, player):
-            print_board(board)
-            if mode == 2 and player == "O":
-                print("AI wins!")
-            else:
-                print(f"Player {player} wins!")
-            break
-
-        if is_full(board):
-            print_board(board)
-            print("It's a draw!")
-            break
-
-        current = 1 - current
-
-    again = input("Play again? (y/n): ").strip().lower()
-    if again == "y":
-        play_game()
-
-
-if __name__ == "__main__":
-    play_game()
+            return {
+                "status": "success",
+                "transaction_id": gateway_response["transaction_id"],
+                "processed_at": datetime.utcnow().isoformat(),
+            }
+        except Exception as exc:
+            self.logger.exception(
+                "payment_gateway_error order=%s customer=%s",
+                request.order_id,
+                request.customer_id,
+            )
+            self.failure_handler.track(request.customer_id)
+            self.failure_handler.log_failure(
+                request,
+                {"status": "error", "message": "gateway_exception", "detail": str(exc)},
+            )
+            return {"status": "failed", "reason": "gateway_error"}
